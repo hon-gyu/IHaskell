@@ -7,9 +7,7 @@
 -- profile specification and returns the channel interface to use.
 module IHaskell.IPython.ZeroMQ (
     ZeroMQInterface(..),
-    ZeroMQStdin(..),
     serveProfile,
-    serveStdin,
     ZeroMQEphemeralPorts,
     withEphemeralPorts,
     ) where
@@ -55,14 +53,15 @@ data ZeroMQInterface =
          , controlReplyChannel :: Chan Message
          -- | Writing to this channel sends an iopub message to the frontend.
          , iopubChannel :: Chan Message
+         -- | Writing here sends an @input_request@ to the frontend over the
+         -- stdin ROUTER socket. The matching @input_reply@ is delivered on
+         -- 'stdinReplyChannel'. Use 'IHaskell.IPython.Stdin' for the high-level
+         -- API; these are the raw channels backing the socket bound eagerly by
+         -- 'serveProfile'.
+         , stdinRequestChannel :: Chan Message
+         , stdinReplyChannel :: Chan Message
          -- | Key used to sign messages.
          , hmacKey :: ByteString
-         }
-
-data ZeroMQStdin =
-       StdinChannel
-         { stdinRequestChannel :: Chan Message
-         , stdinReplyChannel :: Chan Message
          }
 
 -- | Create new channels for a ZeroMQInterface
@@ -73,12 +72,16 @@ newZeroMQInterface key = do
   controlReqChan <- dupChan shellReqChan
   controlRepChan <- newChan
   iopubChan <- newChan
+  stdinReqChan <- newChan
+  stdinRepChan <- newChan
   return $! Channels
     { shellRequestChannel = shellReqChan
     , shellReplyChannel = shellRepChan
     , controlRequestChannel = controlReqChan
     , controlReplyChannel = controlRepChan
     , iopubChannel = iopubChan
+    , stdinRequestChannel = stdinReqChan
+    , stdinReplyChannel = stdinRepChan
     , hmacKey = key
     }
 
@@ -98,6 +101,10 @@ serveProfile profile debug = do
     _ <- forkIO $ serveSocket ctxt Rep (ip profile) (hbPort profile) $ heartbeat channels
     _ <- forkIO $ serveSocket ctxt Router (ip profile) (controlPort profile) $ control debug channels
     _ <- forkIO $ serveSocket ctxt Router (ip profile) (shellPort profile) $ shell debug channels
+    -- Bind stdin eagerly. The spec calls stdin optional, but non-libzmq
+    -- frontends (e.g. Zed's pure-Rust zmq.rs) block on the TCP connect to
+    -- this port. If nothing ever requests input, the handler just sits idle.
+    _ <- forkIO $ serveSocket ctxt Router (ip profile) (stdinPort profile) $ stdin debug channels
 
     -- The ctxt is reference counted in this thread only. Thus, the last serveSocket cannot be
     -- asynchronous, because otherwise ctxt would be garbage collectable - since it would only be
@@ -114,6 +121,7 @@ data ZeroMQEphemeralPorts =
          , ephControlPort :: !Port
          , ephShellPort :: !Port
          , ephIOPubPort :: !Port
+         , ephStdinPort :: !Port
          , ephSignatureKey :: !ByteString
          }
 
@@ -126,6 +134,7 @@ instance ToJSON ZeroMQEphemeralPorts where
       , "hb_port" .= ephHbPort ports
       , "shell_port" .= ephShellPort ports
       , "iopub_port" .= ephIOPubPort ports
+      , "stdin_port" .= ephStdinPort ports
       , "key" .= Text.decodeUtf8 (ephSignatureKey ports)
       ]
 
@@ -161,38 +170,33 @@ withEphemeralPorts key debug callback = do
       withSocket ctxt Router $ \controlportSocket -> do
         withSocket ctxt Router $ \shellportSocket -> do
           withSocket ctxt Pub $ \iopubSocket -> do
-            -- Bind each socket to a local port, getting the port chosen.
-            hbPt <- bindLocalEphemeralPort heartbeatSocket
-            controlPt <- bindLocalEphemeralPort controlportSocket
-            shellPt <- bindLocalEphemeralPort shellportSocket
-            iopubPt <- bindLocalEphemeralPort iopubSocket
-            -- Create object to store ephemeral ports
-            let ports = ZeroMQEphemeralPorts hbPt controlPt shellPt iopubPt key
-            -- Launch actions to listen to communicate between channels and cockets.
-            _ <- forkIO $ forever $ heartbeat channels heartbeatSocket
-            _ <- forkIO $ forever $ control debug channels controlportSocket
-            _ <- forkIO $ forever $ shell debug channels shellportSocket
-            _ <- forkIO $ checkedIOpub debug channels iopubSocket
-            -- Run callback function; provide it with both ports and channels.
-            callback ports channels
+            withSocket ctxt Router $ \stdinSocket -> do
+              -- Bind each socket to a local port, getting the port chosen.
+              hbPt <- bindLocalEphemeralPort heartbeatSocket
+              controlPt <- bindLocalEphemeralPort controlportSocket
+              shellPt <- bindLocalEphemeralPort shellportSocket
+              iopubPt <- bindLocalEphemeralPort iopubSocket
+              stdinPt <- bindLocalEphemeralPort stdinSocket
+              -- Create object to store ephemeral ports
+              let ports = ZeroMQEphemeralPorts hbPt controlPt shellPt iopubPt stdinPt key
+              -- Launch actions to listen to communicate between channels and cockets.
+              _ <- forkIO $ forever $ heartbeat channels heartbeatSocket
+              _ <- forkIO $ forever $ control debug channels controlportSocket
+              _ <- forkIO $ forever $ shell debug channels shellportSocket
+              _ <- forkIO $ forever $ stdin debug channels stdinSocket
+              _ <- forkIO $ checkedIOpub debug channels iopubSocket
+              -- Run callback function; provide it with both ports and channels.
+              callback ports channels
 
-serveStdin :: Profile -> IO ZeroMQStdin
-serveStdin profile = do
-  reqChannel <- newChan
-  repChannel <- newChan
-
-  -- Create the context in a separate thread that never finishes. If withContext or withSocket
-  -- complete, the context or socket become invalid.
-  _ <- forkIO $ withContext $ \ctxt ->
-    -- Serve on all sockets.
-    serveSocket ctxt Router (ip profile) (stdinPort profile) $ \sock -> do
-      -- Read the request from the interface channel and send it.
-      readChan reqChannel >>= sendMessage False (signatureKey profile) sock
-
-      -- Receive a response and write it to the interface channel.
-      receiveMessage False sock >>= writeChan repChannel
-
-  return $ StdinChannel reqChannel repChannel
+-- | Listener on the stdin port. Reads outgoing @input_request@ messages from
+-- the interface and forwards them to the frontend; waits for the matching
+-- @input_reply@ and pushes it back through the interface. If no code is
+-- currently requesting input, this just blocks on the request channel — the
+-- socket itself stays bound either way.
+stdin :: Bool -> ZeroMQInterface -> Socket Router -> IO ()
+stdin debug channels sock = do
+  readChan (stdinRequestChannel channels) >>= sendMessage debug (hmacKey channels) sock
+  receiveMessage debug sock >>= writeChan (stdinReplyChannel channels)
 
 -- | Serve on a given sock in a separate thread. Bind the sock in the | given context and then
 -- loop the provided action, which should listen | on the sock and respond to any events.
