@@ -138,10 +138,6 @@ runKernel kOpts profileSrc = do
   let profileErr = error $ "ihaskell: "++profileSrc++": Failed to parse profile file"
   profile <- fromMaybe profileErr . decode <$> LBS.readFile profileSrc
 
-  -- Necessary for `getLine` and their ilk to work.
-  dir <- getIHaskellDir
-  Stdin.recordKernelProfile dir profile
-
   when useStack $ do
     -- Detect if we have stack
     runResult <- try $ readProcessWithExitCode "stack" [] ""
@@ -166,6 +162,10 @@ runKernel kOpts profileSrc = do
 
   -- Serve on all sockets and ports defined in the profile.
   interface <- serveProfile profile debug
+
+  -- Hand the eagerly-bound stdin channels to the Stdin module so that, once
+  -- the GHC session runs fixStdin, getLine/input() can use them.
+  Stdin.installStdinChannels (stdinRequestChannel interface) (stdinReplyChannel interface)
 
   -- Create initial state in the directory the kernel *should* be in.
   state <- initialKernelState kOpts

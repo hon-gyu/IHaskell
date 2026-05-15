@@ -7,23 +7,21 @@
 -- However, it is difficult to find another way to do it, as file handles are generally meant to
 -- point to streams and files, and not networked communication protocols.
 --
--- In order to use this module, it must first be initialized with two things. First of all, in order
--- to know how to communicate with the IPython frontend, it must know the kernel profile used for
--- communication. For this, use @recordKernelProfile@ once the profile is known. Both this and
--- @recordParentHeader@ take a directory name where they can store this data.
+-- Before using this module, the host (non-GHC) side must hand the stdin channels off via
+-- @installStdinChannels@. These channels are populated by 'serveProfile', which eagerly binds the
+-- stdin ROUTER socket so that frontends which block on the TCP connect (e.g. Zed's pure-Rust
+-- zmq.rs) can complete their handshake immediately.
 --
+-- The module must also know what @execute_request@ message is currently being replied to (which
+-- will request the input). Every time the language kernel receives an @execute_request@ message
+-- it should inform this module via @recordParentHeader@, so that the module may generate messages
+-- with an appropriate parent header set. If this is not done, the IPython frontends will not
+-- recognize the target of the communication.
 --
--- Finally, the module must know what @execute_request@ message is currently being replied to (which
--- will request the input). Thus, every time the language kernel receives an @execute_request@
--- message, it should inform this module via @recordParentHeader@, so that the module may generate
--- messages with an appropriate parent header set. If this is not done, the IPython frontends will
--- not recognize the target of the communication.
---
--- Finally, in order to activate this module, @fixStdin@ must be called once. It must be passed the
--- same directory name as @recordParentHeader@ and @recordKernelProfile@. Note that if this is being
--- used from within the GHC API, @fixStdin@ /must/ be called from within the GHC session not from
--- the host code.
-module IHaskell.IPython.Stdin (fixStdin, recordParentHeader, recordKernelProfile) where
+-- Finally, in order to activate this module, @fixStdin@ must be called once. Note that if this is
+-- being used from within the GHC API, @fixStdin@ /must/ be called from within the GHC session not
+-- from the host code.
+module IHaskell.IPython.Stdin (fixStdin, installStdinChannels, recordParentHeader) where
 
 import           IHaskellPrelude
 
@@ -42,21 +40,24 @@ import           IHaskell.IPython.Types
 import           IHaskell.IPython.ZeroMQ
 import           IHaskell.IPython.Message.UUID as UUID
 
-stdinInterface :: MVar ZeroMQStdin
-{-# NOINLINE stdinInterface #-}
-stdinInterface = unsafePerformIO newEmptyMVar
+-- The stdin request/reply channels backing the ROUTER socket bound by
+-- 'serveProfile'. Populated by 'installStdinChannels' on the host side; read
+-- by 'getInputLine' inside the GHC session. Both sides live in the same OS
+-- process, so the top-level MVar is shared.
+stdinChannels :: MVar (Chan Message, Chan Message)
+{-# NOINLINE stdinChannels #-}
+stdinChannels = unsafePerformIO newEmptyMVar
+
+-- | Hand the stdin channels (from 'ZeroMQInterface') to this module. Call
+-- once from the host process before starting the GHC session that will run
+-- 'fixStdin'.
+installStdinChannels :: Chan Message -> Chan Message -> IO ()
+installStdinChannels req rep = putMVar stdinChannels (req, rep)
 
 -- | Manipulate standard input so that it is sourced from the IPython frontend. This function is
 -- build on layers of deep magical hackery, so be careful modifying it.
 fixStdin :: String -> IO ()
-fixStdin dir = do
-  -- Initialize the stdin interface.
-  let fpath = dir </> ".kernel-profile"
-  profile <- fromMaybe (error $ "fixStdin: Failed reading " ++ fpath)
-              . readMay <$> readFile fpath
-  interface <- serveStdin profile
-  putMVar stdinInterface interface
-  void $ forkIO $ stdinOnce dir
+fixStdin dir = void $ forkIO $ stdinOnce dir
 
 stdinOnce :: String -> IO ()
 stdinOnce dir = do
@@ -92,7 +93,7 @@ stdinOnce dir = do
 -- | Get a line of input from the IPython frontend.
 getInputLine :: String -> IO String
 getInputLine dir = do
-  StdinChannel req rep <- readMVar stdinInterface
+  (req, rep) <- readMVar stdinChannels
 
   -- Send a request for input.
   uuid <- UUID.random
@@ -112,7 +113,3 @@ getInputLine dir = do
 recordParentHeader :: String -> MessageHeader -> IO ()
 recordParentHeader dir hdr =
   writeFile (dir ++ "/.last-req-header") $ show hdr
-
-recordKernelProfile :: String -> Profile -> IO ()
-recordKernelProfile dir profile =
-  writeFile (dir ++ "/.kernel-profile") $ show profile
